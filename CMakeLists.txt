@@ -153,8 +153,8 @@ if(CURL_PATCHSTAMP)
   set(CURL_PATCHSTAMP "\"${CURL_PATCHSTAMP}\"")
 endif()
 
-set(LIB_NAME "libcurl")
-set(EXE_NAME "curl")
+set(LIB_NAME "libcurl-impersonate")
+set(EXE_NAME "curl-impersonate")
 
 set_property(DIRECTORY APPEND PROPERTY INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/include")
 
@@ -858,9 +858,15 @@ if(CURL_USE_OPENSSL)
         message(WARNING "AWS-LC/BoringSSL requires POSIX Threads.")
       endif()
     endif()
-    if(OPENSSL_USE_STATIC_LIBS AND CMAKE_C_COMPILER_ID MATCHES "Clang")
-      list(APPEND CURL_LIBS "stdc++")
-      list(APPEND CMAKE_REQUIRED_LIBRARIES "stdc++")
+    if(OPENSSL_USE_STATIC_LIBS AND
+       CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+      if(APPLE OR BSD OR ANDROID)
+        set(_cxx_runtime_lib "c++")
+      else()
+        set(_cxx_runtime_lib "stdc++")
+      endif()
+      list(APPEND CURL_LIBS "${_cxx_runtime_lib}")
+      list(APPEND CMAKE_REQUIRED_LIBRARIES "${_cxx_runtime_lib}")
     endif()
   endif()
 
@@ -2105,7 +2111,7 @@ endif()
 
 if(NOT CURL_DISABLE_INSTALL)
 
-  # curl-config needs the following options to be set.
+  # curl-impersonate-config needs the following options to be set.
   set(CC                      "${CMAKE_C_COMPILER}")
   set(CONFIGURE_OPTIONS       "")
   set(CURLVERSION             "${_curl_version}")
@@ -2303,7 +2309,7 @@ if(NOT CURL_DISABLE_INSTALL)
     set(ENABLE_STATIC       "no")
   endif()
 
-  # Generate a "curl-config" matching this config.
+  # Generate a "curl-impersonate-config" matching this config.
   # Consumed variables:
   #   CC
   #   CONFIGURE_OPTIONS
@@ -2325,8 +2331,8 @@ if(NOT CURL_DISABLE_INSTALL)
   #   VERSIONNUM
   configure_file(
     "${PROJECT_SOURCE_DIR}/curl-config.in"
-    "${PROJECT_BINARY_DIR}/curl-config" @ONLY)
-  install(FILES "${PROJECT_BINARY_DIR}/curl-config"
+    "${PROJECT_BINARY_DIR}/curl-impersonate-config" @ONLY)
+  install(FILES "${PROJECT_BINARY_DIR}/curl-impersonate-config"
     DESTINATION ${CMAKE_INSTALL_BINDIR}
     PERMISSIONS
       OWNER_READ OWNER_WRITE OWNER_EXECUTE
@@ -2463,7 +2469,7 @@ if(NOT CURL_DISABLE_INSTALL)
   endif()
 
   if(BUILD_CURL_EXE)
-    install(FILES "${PROJECT_SOURCE_DIR}/scripts/wcurl"
+    install(FILES "${PROJECT_SOURCE_DIR}/scripts/wcurl-impersonate"
       DESTINATION ${CMAKE_INSTALL_BINDIR}
       PERMISSIONS
         OWNER_READ OWNER_WRITE OWNER_EXECUTE

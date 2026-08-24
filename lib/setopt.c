@@ -46,8 +46,10 @@
 #include "altsvc.h"
 #include "hsts.h"
 #include "tftp.h"
+#include "slist.h"
 #include "curlx/strdup.h"
 #include "escape.h"
+#include "curl_ctype.h"
 #include "bufref.h"
 #include "vauth/vauth.h"
 
@@ -96,6 +98,95 @@ CURLcode Curl_setstropt(char **charp, const char *s)
   }
 
   return CURLE_OK;
+}
+
+static bool setopt_valid_form_boundary(const char *value)
+{
+  return curl_strequal(value, "webkit") ||
+         curl_strequal(value, "firefox");
+}
+
+/* Return whether `c` is valid in an HTTP field name. */
+static bool http_header_order_name_char(char c)
+{
+  return ISALNUM(c) || c == '!' || c == '#' || c == '$' ||
+         c == '%' || c == '&' || c == '\'' || c == '*' ||
+         c == '+' || c == '-' || c == '.' || c == '^' ||
+         c == '_' || c == '`' || c == '|' || c == '~';
+}
+
+/* Parse one comma-separated header name and trim surrounding blanks. */
+static void http_header_order_token(const char **pp, const char **pname,
+                                    size_t *pnamelen)
+{
+  const char *p = *pp;
+  const char *name;
+  const char *end;
+
+  while(ISBLANK(*p))
+    p++;
+  name = p;
+  while(*p && *p != ',')
+    p++;
+  end = p;
+  while(end > name && ISBLANK(end[-1]))
+    end--;
+  *pname = name;
+  *pnamelen = (size_t)(end - name);
+  *pp = p;
+}
+
+/* Return whether `name` already appeared earlier in `order`. */
+static bool http_header_order_duplicate(const char *order,
+                                        const char *name, size_t namelen)
+{
+  const char *p = order;
+
+  while(p < name) {
+    const char *prev;
+    size_t prevlen;
+    http_header_order_token(&p, &prev, &prevlen);
+    if(prevlen == namelen && curl_strnequal(prev, name, namelen))
+      return TRUE;
+    if(*p == ',') {
+      p++;
+      if(!*p)
+        return FALSE;
+    }
+  }
+  return FALSE;
+}
+
+/* Validate CURLOPT_HTTPHEADER_ORDER before storing it. */
+static bool setopt_valid_http_header_order(const char *order)
+{
+  const char *p = order;
+
+  if(!order)
+    return TRUE;
+  if(!*order)
+    return FALSE;
+
+  /* Validate comma-separated HTTP field names before storing the option. */
+  while(*p) {
+    const char *name;
+    size_t namelen;
+    size_t i;
+    http_header_order_token(&p, &name, &namelen);
+    if(!namelen || name[0] == ':' ||
+       http_header_order_duplicate(order, name, namelen))
+      return FALSE;
+    for(i = 0; i < namelen; i++) {
+      if(!http_header_order_name_char(name[i]))
+        return FALSE;
+    }
+    if(*p == ',') {
+      p++;
+      if(!*p)
+        return FALSE;
+    }
+  }
+  return TRUE;
 }
 
 CURLcode Curl_setblobopt(struct curl_blob **blobp,
@@ -307,6 +398,9 @@ static CURLcode setopt_HTTP_VERSION(struct Curl_easy *data, long arg)
     return CURLE_UNSUPPORTED_PROTOCOL;
   }
   data->set.httpwant = (unsigned char)arg;
+  /* QUIC inherently uses TLS 1.3, enforced in the QUIC TLS setup. Do not
+   * override the global SSL version here because --http3 may fall back to
+   * HTTP/2 over TLS 1.2. */
   return CURLE_OK;
 }
 #endif /* !CURL_DISABLE_HTTP */
@@ -343,6 +437,8 @@ CURLcode Curl_setopt_SSLVERSION(struct Curl_easy *data, CURLoption option,
 
     primary->version = (unsigned char)version;
     primary->version_max = (unsigned int)version_max;
+    if(option == CURLOPT_SSLVERSION)
+      data->set.ssl_version_set = TRUE;
   }
   return CURLE_OK;
 }
@@ -499,6 +595,9 @@ static CURLcode setopt_long_bool(struct Curl_easy *data, CURLoption option,
      */
     s->cookiesession = enabled;
     break;
+  case CURLOPT_SPLIT_COOKIES:
+    s->split_cookies = enabled;
+    break;
 #endif
   case CURLOPT_AUTOREFERER:
     /*
@@ -585,6 +684,9 @@ static CURLcode setopt_long_bool(struct Curl_easy *data, CURLoption option,
      * set transfer mode (;type=<a|i>) when doing FTP via an HTTP proxy
      */
     s->proxy_transfer_mode = enabled;
+    break;
+  case CURLOPT_PROXY_CREDENTIAL_NO_REUSE:
+    s->proxy_credential_no_reuse = enabled;
     break;
 #endif /* !CURL_DISABLE_PROXY */
 #if defined(HAVE_GSSAPI) || defined(USE_WINDOWS_SSPI)
@@ -775,6 +877,30 @@ static CURLcode setopt_long_bool(struct Curl_easy *data, CURLoption option,
 #endif
   case CURLOPT_SSL_ENABLE_ALPN:
     s->ssl_enable_alpn = enabled;
+    break;
+  case CURLOPT_SSL_ENABLE_ALPS:
+    s->ssl_enable_alps = enabled;
+    break;
+  case CURLOPT_SSL_ENABLE_TICKET:
+    s->ssl_enable_ticket = enabled;
+    break;
+  case CURLOPT_WS_SSL_DISABLE_TICKET:
+    s->ws_disable_session_ticket = enabled;
+    break;
+  case CURLOPT_SSL_PERMUTE_EXTENSIONS:
+    s->ssl_permute_extensions = enabled;
+    break;
+  case CURLOPT_TLS_GREASE:
+    s->tls_grease = enabled;
+    break;
+  case CURLOPT_TLS_KEY_USAGE_NO_CHECK:
+    s->tls_key_usage_no_check = enabled;
+    break;
+  case CURLOPT_TLS_SIGNED_CERT_TIMESTAMPS:
+    s->tls_signed_cert_timestamps = enabled;
+    break;
+  case CURLOPT_TLS_STATUS_REQUEST:
+    s->tls_status_request = enabled;
     break;
   case CURLOPT_PATH_AS_IS:
     s->path_as_is = enabled;
@@ -987,6 +1113,15 @@ static CURLcode setopt_long_ssl(struct Curl_easy *data, CURLoption option,
 #endif
   case CURLOPT_SSL_ENABLE_NPN:
     break;
+  case CURLOPT_TLS_RECORD_SIZE_LIMIT:
+    s->tls_record_size_limit = (int)arg;
+    break;
+  case CURLOPT_TLS_KEY_SHARES_LIMIT:
+    s->tls_key_shares_limit = (int)arg;
+    break;
+  case CURLOPT_TLS_USE_NEW_ALPS_CODEPOINT:
+    s->tls_use_new_alps_codepoint = !!arg;
+    break;
   case CURLOPT_SSLENGINE_DEFAULT:
     curlx_safefree(s->str[STRING_SSL_ENGINE]);
     result = Curl_ssl_set_engine_default(data);
@@ -1064,7 +1199,7 @@ static CURLcode setopt_long_http(struct Curl_easy *data, CURLoption option,
 
   switch(option) {
   case CURLOPT_FOLLOWLOCATION:
-    if((unsigned long)arg > 3)
+    if((unsigned long)arg > CURLFOLLOW_SAFE)
       result = CURLE_BAD_FUNCTION_ARGUMENT;
     else
       s->http_follow_mode = (unsigned char)arg;
@@ -1090,6 +1225,29 @@ static CURLcode setopt_long_http(struct Curl_easy *data, CURLoption option,
     return httpauth(data, FALSE, (unsigned long)arg);
   case CURLOPT_HTTP_VERSION:
     return setopt_HTTP_VERSION(data, arg);
+  case CURLOPT_STREAM_EXCLUSIVE:
+#ifdef USE_HTTP2
+    s->priority.exclusive = (int)arg;
+    break;
+#else
+    return CURLE_NOT_BUILT_IN;
+#endif
+  case CURLOPT_HTTP2_WINDOW_UPDATE:
+#ifdef USE_HTTP2
+    if(arg < -1)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    s->http2_window_update = (int)arg;
+    break;
+#else
+    return CURLE_NOT_BUILT_IN;
+#endif
+  case CURLOPT_HTTP2_NO_PRIORITY:
+#ifdef USE_HTTP2
+    s->http2_no_priority = !!arg;
+    break;
+#else
+    return CURLE_NOT_BUILT_IN;
+#endif
   case CURLOPT_EXPECT_100_TIMEOUT_MS:
     result = value_range(&arg, 0, 0, 0xffff);
     if(!result)
@@ -1393,6 +1551,23 @@ static CURLcode setopt_slist(struct Curl_easy *data, CURLoption option,
      */
     s->headers = slist;
     break;
+  case CURLOPT_HTTP3_HTTPHEADER:
+    /* Set an HTTP/3-specific list with HTTP headers to use. */
+    s->http3_headers = slist;
+    break;
+  case CURLOPT_WS_HTTPHEADER:
+    /* Set a WebSocket-specific list with HTTP headers to use. */
+    s->ws_headers = slist;
+    break;
+  case CURLOPT_HTTPBASEHEADER:
+    /* curl-impersonate: Set default browser headers to merge with
+     * CURLOPT_HTTPHEADER. Unlike CURLOPT_HTTPHEADER, this list is copied and
+     * may be freed immediately by the caller. */
+    curl_slist_free_all(data->state.base_headers);
+    data->state.base_headers = Curl_slist_duplicate(slist);
+    if(slist && !data->state.base_headers)
+      result = CURLE_OUT_OF_MEMORY;
+    break;
 #endif
 #ifndef CURL_DISABLE_TELNET
   case CURLOPT_TELNETOPTIONS:
@@ -1484,6 +1659,9 @@ static CURLcode setopt_pointers(struct Curl_easy *data, CURLoption option,
 #ifndef CURL_DISABLE_MIME
   case CURLOPT_MIMEPOST:
     result = setopt_mimepost(data, va_arg(param, curl_mime *));
+    if(!result && s->str[STRING_FORM_BOUNDARY] && s->mimepostp)
+      result = Curl_mime_set_form_boundary(
+        data, (curl_mime *)s->mimepostp->arg);
     break;
 #endif /* !CURL_DISABLE_MIME */
 #endif /* !CURL_DISABLE_HTTP || !CURL_DISABLE_SMTP || !CURL_DISABLE_IMAP */
@@ -1571,11 +1749,11 @@ static CURLcode cookielist(struct Curl_easy *data, const char *ptr)
     if(checkprefix("Set-Cookie:", ptr))
       /* HTTP Header format line */
       result = Curl_cookie_add(data, data->cookies, TRUE, FALSE, ptr + 11,
-                               NULL, NULL, TRUE);
+                               NULL, NULL, TRUE, FALSE);
     else
       /* Netscape format line */
       result = Curl_cookie_add(data, data->cookies, FALSE, FALSE, ptr, NULL,
-                               NULL, TRUE);
+                               NULL, TRUE, FALSE);
     Curl_share_unlock(data, CURL_LOCK_DATA_COOKIE);
   }
   return result;
@@ -1998,6 +2176,9 @@ static CURLcode setopt_cptr_ssl(struct Curl_easy *data, CURLoption option,
     if(Curl_ssl_supports(data, SSLSUPP_SSL_EC_CURVES))
       return Curl_setstropt(&s->str[STRING_SSL_EC_CURVES], ptr);
     return CURLE_NOT_BUILT_IN;
+  case CURLOPT_HTTP3_SSL_EC_CURVES:
+    /* Set HTTP/3-specific accepted curves in SSL connection setup. */
+    return Curl_setstropt(&s->str[STRING_HTTP3_SSL_EC_CURVES], ptr);
   case CURLOPT_SSL_SIGNATURE_ALGORITHMS:
     /*
      * Set accepted signature algorithms.
@@ -2494,12 +2675,110 @@ static CURLcode setopt_cptr_misc(struct Curl_easy *data, CURLoption option,
   return result;
 }
 
+static CURLcode setopt_cptr_impersonate(struct Curl_easy *data,
+                                        CURLoption option, char *ptr)
+{
+  struct UserDefined *s = &data->set;
+
+  switch(option) {
+  case CURLOPT_IMPERSONATE: {
+    bool default_headers = TRUE;
+    char *p;
+    char *suffix;
+    CURLcode result = Curl_setstropt(&s->str[STRING_IMPERSONATE], ptr);
+    if(result)
+      return result;
+    p = s->str[STRING_IMPERSONATE];
+    if(!p || !*p)
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    suffix = strchr(p, ':');
+    if(suffix) {
+      if((suffix == p) || !suffix[1] || strchr(suffix + 1, ':'))
+        return CURLE_BAD_FUNCTION_ARGUMENT;
+      if(!strcmp(suffix + 1, "yes"))
+        default_headers = TRUE;
+      else if(!strcmp(suffix + 1, "no"))
+        default_headers = FALSE;
+      else
+        return CURLE_BAD_FUNCTION_ARGUMENT;
+      *suffix = '\0';
+      result = curl_easy_impersonate(data, p, default_headers);
+      *suffix = ':';
+      return result;
+    }
+    return curl_easy_impersonate(data, p, TRUE);
+  }
+  case CURLOPT_FORM_BOUNDARY: {
+    CURLcode result;
+    if(ptr && !setopt_valid_form_boundary(ptr))
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    result = Curl_setstropt(&s->str[STRING_FORM_BOUNDARY], ptr);
+#if !defined(CURL_DISABLE_MIME) || !defined(CURL_DISABLE_FORM_API)
+    if(!result && s->mimepostp)
+      result = Curl_mime_set_form_boundary(
+        data, (curl_mime *)s->mimepostp->arg);
+#endif
+    return result;
+  }
+  case CURLOPT_TLS_EXTENSION_ORDER:
+    return Curl_setstropt(&s->str[STRING_TLS_EXTENSION_ORDER], ptr);
+  case CURLOPT_HTTP2_PSEUDO_HEADERS_ORDER:
+    return Curl_setstropt(&s->str[STRING_HTTP2_PSEUDO_HEADERS_ORDER], ptr);
+  case CURLOPT_HTTP2_SETTINGS:
+    return Curl_setstropt(&s->str[STRING_HTTP2_SETTINGS], ptr);
+  case CURLOPT_HTTPHEADER_ORDER:
+    if(!setopt_valid_http_header_order(ptr))
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    return Curl_setstropt(&s->str[STRING_HTTPHEADER_ORDER], ptr);
+  case CURLOPT_HTTP3_HTTPHEADER_ORDER:
+    if(!setopt_valid_http_header_order(ptr))
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    return Curl_setstropt(&s->str[STRING_HTTP3_HTTPHEADER_ORDER], ptr);
+  case CURLOPT_WS_HTTPHEADER_ORDER:
+    if(!setopt_valid_http_header_order(ptr))
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    return Curl_setstropt(&s->str[STRING_WS_HTTPHEADER_ORDER], ptr);
+  case CURLOPT_HTTP3_PSEUDO_HEADERS_ORDER:
+    return Curl_setstropt(&s->str[STRING_HTTP3_PSEUDO_HEADERS_ORDER], ptr);
+  case CURLOPT_HTTP3_SETTINGS:
+    return Curl_setstropt(&s->str[STRING_HTTP3_SETTINGS], ptr);
+  case CURLOPT_QUIC_CID_LENGTH:
+    if(ptr && strcmp(ptr, "webkit") && strcmp(ptr, "firefox"))
+      return CURLE_BAD_FUNCTION_ARGUMENT;
+    return Curl_setstropt(&s->str[STRING_QUIC_CID_LENGTH], ptr);
+  case CURLOPT_QUIC_TRANSPORT_PARAMETERS:
+    return Curl_setstropt(&s->str[STRING_QUIC_TRANSPORT_PARAMETERS], ptr);
+  case CURLOPT_HTTP3_SIG_HASH_ALGS:
+    return Curl_setstropt(&s->str[STRING_HTTP3_SIG_HASH_ALGS], ptr);
+  case CURLOPT_HTTP3_TLS_EXTENSION_ORDER:
+    return Curl_setstropt(&s->str[STRING_HTTP3_TLS_EXTENSION_ORDER], ptr);
+  case CURLOPT_HTTP2_STREAMS:
+    return Curl_setstropt(&s->str[STRING_HTTP2_STREAMS], ptr);
+  case CURLOPT_SSL_SIG_HASH_ALGS:
+    /* Backwards-compatible alias for
+     * CURLOPT_SSL_SIGNATURE_ALGORITHMS. */
+    return Curl_setstropt(&s->str[STRING_SSL_SIGNATURE_ALGORITHMS], ptr);
+  case CURLOPT_SSL_CERT_COMPRESSION:
+    /* Set the comma-delimited list of TLS certificate compression
+     * algorithms. Supported values include "zlib" and "brotli". */
+    return Curl_setstropt(&s->str[STRING_SSL_CERT_COMPRESSION], ptr);
+  case CURLOPT_WS_SSL_CERT_COMPRESSION:
+    /* Set the TLS certificate compression algorithms for WebSocket. */
+    return Curl_setstropt(&s->str[STRING_WS_SSL_CERT_COMPRESSION], ptr);
+  case CURLOPT_TLS_DELEGATED_CREDENTIALS:
+    return Curl_setstropt(&s->str[STRING_TLS_DELEGATED_CREDENTIALS], ptr);
+  default:
+    return CURLE_UNKNOWN_OPTION;
+  }
+}
+
 static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
                             char *ptr)
 {
   typedef CURLcode (*ptrfunc)(struct Curl_easy *data, CURLoption option,
                               char *ptr);
   static const ptrfunc setopt_call[] = {
+    setopt_cptr_impersonate,
 #ifndef CURL_DISABLE_PROXY
     setopt_cptr_proxy,
 #endif
@@ -2892,6 +3171,9 @@ CURLcode Curl_vsetopt(struct Curl_easy *data, CURLoption option, va_list param)
        way than being listed explicitly */
     switch(option) {
     case CURLOPT_HTTPHEADER:
+    case CURLOPT_HTTP3_HTTPHEADER:
+    case CURLOPT_HTTPBASEHEADER:
+    case CURLOPT_WS_HTTPHEADER:
     case CURLOPT_QUOTE:
     case CURLOPT_POSTQUOTE:
     case CURLOPT_TELNETOPTIONS:

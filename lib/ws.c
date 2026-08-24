@@ -27,6 +27,20 @@
 
 #ifndef CURL_DISABLE_WEBSOCKETS
 
+/* Include architecture-specific SIMD intrinsics and CPUID headers. MSVC
+ * requires <intrin.h>, while GCC and Clang use <cpuid.h>. */
+#if defined(__x86_64__) || defined(_M_X64) || \
+    defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
+#elif defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 #include "url.h"
 #include "bufq.h"
 #include "curlx/dynbuf.h"
@@ -71,8 +85,225 @@
 #define WSBIT_MASK 0x80
 
 /* buffer dimensioning */
-#define WS_CHUNK_SIZE  65535
-#define WS_CHUNK_COUNT 2
+#define WS_CHUNK_SIZE  131072
+#define WS_CHUNK_COUNT 4
+
+#ifndef WS_ENC_XBUF_SIZE
+#define WS_ENC_XBUF_SIZE 8192
+#endif
+
+/* Feature bitmask constants. */
+#define WS_CPU_FEAT_INIT   (1 << 0)
+#define WS_CPU_FEAT_AVX2   (1 << 1)
+#define WS_CPU_FEAT_AVX512 (1 << 2)
+
+/* Determine endianness across supported compilers and operating systems. */
+#if (defined(__BYTE_ORDER__) && \
+     (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)) || \
+    defined(_WIN32) || defined(_WIN64) || defined(__LITTLE_ENDIAN__) || \
+    defined(__ARMEL__) || defined(__AARCH64EL__) || \
+    defined(_M_IX86) || defined(_M_X64) || \
+    defined(_M_ARM) || defined(_M_ARM64)
+#define WS_IS_LITTLE_ENDIAN 1
+#else
+#define WS_IS_LITTLE_ENDIAN 0
+#endif
+
+/* Identify architectures with native 64-bit scalar operations. */
+#if defined(__x86_64__) || defined(_M_X64) || \
+    defined(__aarch64__) || defined(_M_ARM64)
+#define WS_64BIT_NATIVE 1
+#else
+#define WS_64BIT_NATIVE 0
+#endif
+
+/* SIMD configuration. */
+#if WS_IS_LITTLE_ENDIAN
+
+#if defined(__x86_64__) || defined(_M_X64) || \
+    defined(__i386__) || defined(_M_IX86)
+#define WS_HAVE_X86_SIMD 1
+#if defined(__GNUC__) || defined(__clang__)
+#if defined(__has_attribute)
+#if __has_attribute(target)
+#define WS_TARGET_AVX2 __attribute__((target("avx2")))
+#if defined(__clang__) && \
+    ((defined(__apple_build_version__) && __clang_major__ >= 16) || \
+     (!defined(__apple_build_version__) && __clang_major__ >= 18))
+#define WS_TARGET_AVX512 \
+  __attribute__((target("avx512f,evex512")))
+#else
+#define WS_TARGET_AVX512 __attribute__((target("avx512f")))
+#endif
+#define WS_SUPPORT_AVX_RUNTIME 1
+#else
+#define WS_TARGET_AVX2
+#define WS_TARGET_AVX512
+#endif
+#else
+#define WS_TARGET_AVX2
+#define WS_TARGET_AVX512
+#endif
+#else
+#define WS_TARGET_AVX2
+#define WS_TARGET_AVX512
+#endif
+
+#ifdef _MSC_VER
+#define WS_ATOMIC_LOAD(var) \
+  (uint32_t)_InterlockedOr((volatile long *)&(var), 0)
+#define WS_ATOMIC_STORE(var, val) \
+  _InterlockedExchange((volatile long *)&(var), (long)(val))
+#else
+#define WS_ATOMIC_LOAD(var) \
+  __atomic_load_n(&(var), __ATOMIC_RELAXED)
+#define WS_ATOMIC_STORE(var, val) \
+  __atomic_store_n(&(var), (val), __ATOMIC_RELAXED)
+#endif
+#endif
+
+/* ARM SIMD configuration. */
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(__ARM_NEON)
+#define WS_HAVE_ARM_SIMD 1
+#endif
+
+#ifdef WS_HAVE_X86_SIMD
+
+/* AVX-512 path: 128 bytes per iteration, unrolled twice. */
+#if defined(WS_SUPPORT_AVX_RUNTIME) || defined(__AVX512F__)
+WS_TARGET_AVX512
+static size_t ws_xor_avx512(const uint8_t *src, uint8_t *dst,
+                            size_t len, uint32_t m32)
+{
+  size_t i = 0;
+  __m512i vmask = _mm512_set1_epi32((int)m32);
+  for(; i + 128 <= len; i += 128) {
+    __m512i v0 = _mm512_loadu_si512((const __m512i *)(const void *)
+                                    (src + i));
+    __m512i v1 = _mm512_loadu_si512((const __m512i *)(const void *)
+                                    (src + i + 64));
+    _mm512_storeu_si512((__m512i *)(void *)(dst + i),
+                        _mm512_xor_si512(v0, vmask));
+    _mm512_storeu_si512((__m512i *)(void *)(dst + i + 64),
+                        _mm512_xor_si512(v1, vmask));
+  }
+  return i;
+}
+#endif
+
+/* AVX2 path: 64 bytes per iteration, unrolled twice. */
+#if defined(WS_SUPPORT_AVX_RUNTIME) || defined(__AVX2__)
+WS_TARGET_AVX2
+static size_t ws_xor_avx2(const uint8_t *src, uint8_t *dst,
+                          size_t len, uint32_t m32)
+{
+  size_t i = 0;
+  __m256i vmask = _mm256_set1_epi32((int)m32);
+  for(; i + 64 <= len; i += 64) {
+    __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)
+                                    (src + i));
+    __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)
+                                    (src + i + 32));
+    _mm256_storeu_si256((__m256i *)(void *)(dst + i),
+                        _mm256_xor_si256(v0, vmask));
+    _mm256_storeu_si256((__m256i *)(void *)(dst + i + 32),
+                        _mm256_xor_si256(v1, vmask));
+  }
+  return i;
+}
+#endif
+
+/* Check both CPU feature bits and operating-system SIMD support. */
+static uint32_t ws_get_cpu_features(void)
+{
+  uint32_t features = WS_CPU_FEAT_INIT;
+
+#ifdef _MSC_VER
+  int cpuinfo[4];
+  int max_leaf;
+  unsigned __int64 xcr0;
+
+  /* Check the maximum supported CPUID leaf. */
+  __cpuid(cpuinfo, 0);
+  max_leaf = cpuinfo[0];
+  if(max_leaf < 1)
+    return features;
+
+  __cpuidex(cpuinfo, 1, 0);
+  /* Check XSAVE, OSXSAVE and AVX. */
+  if((cpuinfo[2] & ((1 << 26) | (1 << 27) | (1 << 28))) !=
+     ((1 << 26) | (1 << 27) | (1 << 28)))
+    return features;
+
+  xcr0 = _xgetbv(0);
+  if((xcr0 & 0x06) != 0x06)
+    return features;
+
+  if(max_leaf >= 7) {
+    __cpuidex(cpuinfo, 7, 0);
+    if(cpuinfo[1] & (1 << 5))
+      features |= WS_CPU_FEAT_AVX2;
+    if(((xcr0 & 0xe6) == 0xe6) && (cpuinfo[1] & (1 << 16)))
+      features |= WS_CPU_FEAT_AVX512;
+  }
+#elif defined(__GNUC__) || defined(__clang__)
+  unsigned int eax = 0;
+  unsigned int ebx = 0;
+  unsigned int ecx = 0;
+  unsigned int edx = 0;
+  unsigned int max_leaf;
+  uint32_t xcr0_eax;
+  uint32_t xcr0_edx;
+
+  /* Check the maximum supported CPUID leaf. */
+  max_leaf = __get_cpuid_max(0, NULL);
+  if(max_leaf < 1)
+    return features;
+  if(!__get_cpuid(1, &eax, &ebx, &ecx, &edx))
+    return features;
+  /* Check XSAVE, OSXSAVE and AVX. */
+  if((ecx & ((1 << 26) | (1 << 27) | (1 << 28))) !=
+     ((1 << 26) | (1 << 27) | (1 << 28)))
+    return features;
+
+  __asm__ volatile("xgetbv" : "=a"(xcr0_eax), "=d"(xcr0_edx) : "c"(0));
+  (void)xcr0_edx;
+  if((xcr0_eax & 0x06) != 0x06)
+    return features;
+
+  if(max_leaf >= 7) {
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    if(ebx & (1 << 5))
+      features |= WS_CPU_FEAT_AVX2;
+    if(((xcr0_eax & 0xe6) == 0xe6) && (ebx & (1 << 16)))
+      features |= WS_CPU_FEAT_AVX512;
+  }
+#endif
+
+  return features;
+}
+#endif
+
+#ifdef WS_HAVE_ARM_SIMD
+/* NEON path: 32 bytes per iteration, unrolled twice. */
+static size_t ws_xor_neon(const uint8_t *src, uint8_t *dst,
+                          size_t len, uint32_t m32)
+{
+  size_t i = 0;
+  uint32x4_t vmask = vdupq_n_u32(m32);
+  for(; i + 32 <= len; i += 32) {
+    uint8x16_t v0 = vld1q_u8(src + i);
+    uint8x16_t v1 = vld1q_u8(src + i + 16);
+    v0 = veorq_u8(v0, vreinterpretq_u8_u32(vmask));
+    v1 = veorq_u8(v1, vreinterpretq_u8_u32(vmask));
+    vst1q_u8(dst + i, v0);
+    vst1q_u8(dst + i + 16, v1);
+  }
+  return i;
+}
+#endif
+
+#endif /* WS_IS_LITTLE_ENDIAN */
 
 /* a client-side WS frame decoder, parsing frame headers and
  * payload, keeping track of current position and stats */
@@ -102,6 +333,7 @@ struct ws_encoder {
   uint8_t mask[4]; /* 32-bit mask for this connection */
   uint8_t firstbyte; /* first byte of frame we encode */
   BIT(contfragment); /* set TRUE if the previous fragment sent was not final */
+  uint8_t xbuf[WS_ENC_XBUF_SIZE]; /* staging buffer for XOR masking */
 };
 
 /* Control frames are allowed up to 125 characters, rfc6455, ch. 5.5 */
@@ -753,9 +985,10 @@ static CURLcode ws_cw_write(struct Curl_easy *data,
     }
   }
 
-  if((type & CLIENTWRITE_EOS) && !Curl_bufq_is_empty(&ctx->buf)) {
-    failf(data, "[WS] decode ending with %zu frame bytes remaining",
-          Curl_bufq_len(&ctx->buf));
+  if((type & CLIENTWRITE_EOS) &&
+     (!Curl_bufq_is_empty(&ctx->buf) || ws->dec.state != WS_DEC_INIT)) {
+    failf(data, "[WS] decode ending with %zu bytes remaining and "
+          "incomplete frame", Curl_bufq_len(&ctx->buf));
     result = CURLE_RECV_ERROR;
   }
 
@@ -951,34 +1184,121 @@ static CURLcode ws_enc_write_payload(struct ws_encoder *enc,
                                      const uint8_t *buf, size_t buflen,
                                      struct bufq *out, size_t *pnwritten)
 {
-  CURLcode result;
-  size_t i, len, n, remain;
+  CURLcode result = CURLE_OK;
+  size_t i = 0;
+  size_t len;
+  size_t remain;
+#if defined(WS_HAVE_X86_SIMD) && WS_IS_LITTLE_ENDIAN
+  static uint32_t cpu_feats;
+  uint32_t features;
+#endif
 
   *pnwritten = 0;
   if(Curl_bufq_is_full(out))
     return CURLE_AGAIN;
 
-  /* not the most performant way to do this */
+  /* A completed payload has nothing more to buffer. */
+  if(enc->payload_remain <= 0) {
+    ws_enc_info(enc, data, "buffered");
+    return CURLE_OK;
+  }
+
   len = buflen;
   remain = curlx_sotouz_range(enc->payload_remain, 0, SIZE_MAX);
   if(remain < len)
     len = remain;
 
-  for(i = 0; i < len; ++i) {
-    uint8_t c = buf[i] ^ enc->mask[enc->xori];
-    result = Curl_bufq_write(out, &c, 1, &n);
-    if(result) {
-      if((result != CURLE_AGAIN) || !i)
-        return result;
-      break;
-    }
-    enc->xori++;
-    enc->xori &= 3;
+#if defined(WS_HAVE_X86_SIMD) && WS_IS_LITTLE_ENDIAN
+  /* Evaluate the process-global CPU feature cache once. */
+  features = WS_ATOMIC_LOAD(cpu_feats);
+  if(!(features & WS_CPU_FEAT_INIT)) {
+    features = ws_get_cpu_features();
+    WS_ATOMIC_STORE(cpu_feats, features);
   }
+  (void)features;
+#endif
+
+  while(i < len) {
+    uint8_t mask[4];
+    size_t chunk = CURLMIN(len - i, (size_t)WS_ENC_XBUF_SIZE);
+    size_t j = 0;
+    size_t xbuf_idx = 0;
+#if WS_IS_LITTLE_ENDIAN
+    uint32_t mask32;
+#endif
+
+    /* Rotate the four-byte mask to the current frame offset. */
+    mask[0] = enc->mask[enc->xori];
+    mask[1] = enc->mask[(enc->xori + 1) & 3];
+    mask[2] = enc->mask[(enc->xori + 2) & 3];
+    mask[3] = enc->mask[(enc->xori + 3) & 3];
+
+#if WS_IS_LITTLE_ENDIAN
+    memcpy(&mask32, mask, sizeof(mask32));
+
+    /* SIMD ladder: 128, 64 or 32 bytes per iteration. */
+#ifdef WS_HAVE_X86_SIMD
+#if defined(WS_SUPPORT_AVX_RUNTIME) || defined(__AVX512F__)
+    if(features & WS_CPU_FEAT_AVX512)
+      j = ws_xor_avx512(buf + i, enc->xbuf, chunk, mask32);
+#endif
+#if defined(WS_SUPPORT_AVX_RUNTIME) || defined(__AVX2__)
+    if(!j && (features & WS_CPU_FEAT_AVX2))
+      j = ws_xor_avx2(buf + i, enc->xbuf, chunk, mask32);
+#endif
+#elif defined(WS_HAVE_ARM_SIMD)
+    j = ws_xor_neon(buf + i, enc->xbuf, chunk, mask32);
+#endif
+
+    /* Scalar ladder: eight or four bytes per iteration. */
+#if WS_64BIT_NATIVE
+    {
+      uint64_t mask64 = ((uint64_t)mask32 << 32) | mask32;
+      for(; j + 8 <= chunk; j += 8) {
+        uint64_t data64;
+        memcpy(&data64, buf + i + j, sizeof(data64));
+        data64 ^= mask64;
+        memcpy(enc->xbuf + j, &data64, sizeof(data64));
+      }
+    }
+#endif
+    for(; j + 4 <= chunk; j += 4) {
+      uint32_t data32;
+      memcpy(&data32, buf + i + j, sizeof(data32));
+      data32 ^= mask32;
+      memcpy(enc->xbuf + j, &data32, sizeof(data32));
+    }
+#endif /* WS_IS_LITTLE_ENDIAN */
+
+    /* Final remainder: one byte per iteration. */
+    for(; j < chunk; ++j)
+      enc->xbuf[j] = buf[i + j] ^ mask[j & 3];
+
+    /* Flush the staging buffer to the connection queue. Short writes and
+     * zero-byte stalls leave the remaining data for a later retry. */
+    while(xbuf_idx < chunk) {
+      size_t n = 0;
+      result = Curl_bufq_write(out, enc->xbuf + xbuf_idx,
+                               chunk - xbuf_idx, &n);
+      if(n) {
+        /* Advance for bytes accepted before a later retry or error. */
+        xbuf_idx += n;
+        i += n;
+        enc->xori = (enc->xori + (unsigned int)n) & 3;
+      }
+      if(result || !n) {
+        if(!result)
+          result = CURLE_AGAIN;
+        goto out;
+      }
+    }
+  }
+
+out:
   *pnwritten = i;
   enc->payload_remain -= (curl_off_t)i;
   ws_enc_info(enc, data, "buffered");
-  return CURLE_OK;
+  return result;
 }
 
 static CURLcode ws_enc_add_pending(struct Curl_easy *data,
@@ -1677,6 +1997,12 @@ static CURLcode ws_flush(struct Curl_easy *data, struct websocket *ws,
           result = CURLE_AGAIN;
       }
 
+      /* A send can report an error after writing a partial amount. */
+      if(n) {
+        CURL_TRC_WS(data, "flushed %zu bytes", n);
+        Curl_bufq_skip(&ws->sendbuf, n);
+      }
+
       if(result == CURLE_AGAIN) {
         CURL_TRC_WS(data, "flush EAGAIN, %zu bytes remain in buffer",
                     Curl_bufq_len(&ws->sendbuf));
@@ -1685,10 +2011,6 @@ static CURLcode ws_flush(struct Curl_easy *data, struct websocket *ws,
       else if(result) {
         failf(data, "[WS] flush, write error %d", (int)result);
         return result;
-      }
-      else {
-        CURL_TRC_WS(data, "flushed %zu bytes", n);
-        Curl_bufq_skip(&ws->sendbuf, n);
       }
     }
   }

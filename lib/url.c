@@ -270,6 +270,8 @@ CURLcode Curl_close(struct Curl_easy **datap)
   curlx_safefree(data->state.most_recent_ftp_entrypath);
   curlx_safefree(data->info.contenttype);
   curlx_safefree(data->info.wouldredirect);
+  curl_slist_free_all(data->info.cookiechanges);
+  Curl_free_redirects(data);
 
   /* No longer a dirty share, if it exists */
   if(Curl_share_easy_unlink(data))
@@ -288,6 +290,10 @@ CURLcode Curl_close(struct Curl_easy **datap)
 #ifndef CURL_DISABLE_RTSP
   curlx_safefree(data->state.aptr.rtsp_transport);
 #endif
+  /* curl-impersonate: Free the list set by CURLOPT_HTTPBASEHEADER. */
+  curl_slist_free_all(data->state.base_headers);
+  /* curl-impersonate: Free the dynamic list of headers. */
+  curl_slist_free_all(data->state.merged_headers);
 
 #if !defined(CURL_DISABLE_HTTP) && !defined(CURL_DISABLE_FORM_API)
   Curl_mime_cleanpart(data->state.formp);
@@ -399,6 +405,7 @@ void Curl_init_userdefined(struct Curl_easy *data)
   Curl_setopt_SSLVERSION(data, CURLOPT_PROXY_SSLVERSION,
                          CURL_SSLVERSION_DEFAULT);
 #endif
+  set->ssl_version_set = FALSE;
 #endif
 #ifndef CURL_DISABLE_FTP
   set->wildcard_enabled = FALSE;
@@ -413,8 +420,14 @@ void Curl_init_userdefined(struct Curl_easy *data)
   set->tcp_fastopen = FALSE;
   set->tcp_nodelay = TRUE;
   set->ssl_enable_alpn = TRUE;
+  set->ssl_enable_ticket = TRUE;
+  set->tls_grease = FALSE;
+  set->tls_use_new_alps_codepoint = FALSE;
   set->expect_100_timeout = 1000L; /* Wait for a second by default. */
   set->sep_headers = TRUE; /* separated header lists by default */
+#ifndef CURL_DISABLE_COOKIES
+  set->split_cookies = FALSE; /* use a single Cookie header by default */
+#endif
   set->buffer_size = READBUFFER_SIZE;
   set->upload_buffer_size = UPLOADBUFFER_DEFAULT;
   set->upload_flags = CURLULFLAG_SEEN;
@@ -1296,6 +1309,10 @@ static struct connectdata *allocate_conn(struct Curl_easy *data)
 #endif
   conn->ip_version = data->set.ipver;
   conn->bits.connect_only = (bool)data->set.connect_only;
+#ifndef CURL_DISABLE_PROXY
+  conn->bits.proxy_credential_no_reuse =
+    data->set.proxy_credential_no_reuse;
+#endif
   conn->transport_wanted = TRNSPRT_TCP; /* most of them are TCP streams */
 
   /* Store the local bind parameters that will be used for this connection */
@@ -2171,6 +2188,11 @@ static CURLcode url_create_needle(struct Curl_easy *data,
        (default) */
     if(data->set.ssl_enable_alpn)
       needle->bits.tls_enable_alpn = TRUE;
+
+    /* curl-impersonate: Turn on ALPS when requested for a protocol which
+     * supports ALPN. */
+    if(data->set.ssl_enable_alps)
+      needle->bits.tls_enable_alps = TRUE;
   }
 
   if(network_scheme) {
@@ -2373,7 +2395,7 @@ static CURLcode url_find_or_create_conn(struct Curl_easy *data)
 #endif
 
   /* Complete the easy's SSL configuration for connection cache matching */
-  result = Curl_ssl_easy_config_complete(data, needle->origin);
+  result = Curl_ssl_easy_config_complete_conn(data, needle);
   if(result)
     goto out;
 
@@ -2421,7 +2443,6 @@ static CURLcode url_find_or_create_conn(struct Curl_easy *data)
     /* We have decided that we want a new connection. We may not be able to do
        that if we have reached the limit of how many connections we are
        allowed to open. */
-
     if(waitpipe) {
       /* There is a connection that *might* become usable for multiplexing
          "soon", and we wait for that */

@@ -25,7 +25,11 @@
  ***************************************************************************/
 #include "curl_setup.h"
 
-#ifndef CURL_DISABLE_PROXY
+#ifdef CURL_DISABLE_PROXY
+
+#define Curl_cf_socks_proxy_is_udp_associate(x) FALSE
+
+#else
 
 struct Curl_peer;
 struct Curl_creds;
@@ -62,8 +66,11 @@ CURLcode Curl_cf_socks_proxy_insert_after(struct Curl_cfilter *cf_at,
                                           uint8_t proxy_type,
                                           struct Curl_creds *creds);
 
+/* Query whether a SOCKS filter in the chain uses UDP ASSOCIATE. */
+bool Curl_cf_socks_proxy_is_udp_associate(struct Curl_cfilter *cf);
+
 extern struct Curl_cftype Curl_cft_socks_proxy;
 
-#endif /* !CURL_DISABLE_PROXY */
+#endif /* CURL_DISABLE_PROXY */
 
 #endif /* HEADER_CURL_SOCKS_H */

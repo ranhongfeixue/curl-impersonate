@@ -52,7 +52,8 @@
 CURLcode Curl_vquic_tls_peer_init(struct Curl_peer *origin,
                                   struct Curl_peer *peer,
                                   struct ssl_primary_config *sslc,
-                                  struct ssl_peer *ssl_peer)
+                                  struct ssl_peer *ssl_peer,
+                                  struct connectdata *conn)
 {
   char tls_id[80];
 
@@ -69,7 +70,7 @@ CURLcode Curl_vquic_tls_peer_init(struct Curl_peer *origin,
   if(ssl_peer->origin || ssl_peer->peer)
     Curl_ssl_peer_cleanup(ssl_peer);
   return Curl_ssl_peer_init(ssl_peer, origin, peer, sslc,
-                            tls_id, TRNSPRT_QUIC);
+                            tls_id, TRNSPRT_QUIC, conn);
 }
 
 CURLcode Curl_vquic_tls_init(struct curl_tls_ctx *ctx,

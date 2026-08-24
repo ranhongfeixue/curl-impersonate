@@ -64,6 +64,8 @@ struct dynbuf;
   "ALPN: server did not agree on a protocol. Uses default."
 #define VTLS_INFOF_ALPN_OFFER_1STR    \
   "ALPN: curl offers %s"
+#define VTLS_INFOF_ALPS_OFFER_1STR    \
+  "ALPS: offers %s"
 #define VTLS_INFOF_ALPN_ACCEPTED      \
   ALPN_ACCEPTED "%.*s"
 
@@ -112,7 +114,8 @@ CURLcode Curl_ssl_peer_init(struct ssl_peer *ssl_peer,
                             struct Curl_peer *peer,
                             struct ssl_primary_config *sslc,
                             const char *tls_id,
-                            uint8_t transport);
+                            uint8_t transport,
+                            struct connectdata *conn);
 /**
  * Free all allocated data and reset peer information.
  */

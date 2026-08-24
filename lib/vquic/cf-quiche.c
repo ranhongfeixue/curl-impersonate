@@ -110,7 +110,8 @@ static void h3_stream_hash_free(unsigned int id, void *stream);
 static CURLcode cf_quiche_ctx_init(struct cf_quiche_ctx *ctx,
                                    struct Curl_peer *origin,
                                    struct Curl_peer *peer,
-                                   struct ssl_primary_config *sslc)
+                                   struct ssl_primary_config *sslc,
+                                   struct connectdata *conn)
 {
   DEBUGASSERT(!ctx->initialized);
 #ifdef DEBUG_QUICHE
@@ -125,7 +126,7 @@ static CURLcode cf_quiche_ctx_init(struct cf_quiche_ctx *ctx,
                   BUFQ_OPT_SOFT_LIMIT);
   ctx->data_recvd = 0;
   ctx->initialized = TRUE;
-  return Curl_vquic_tls_peer_init(origin, peer, sslc, &ctx->ssl_peer);
+  return Curl_vquic_tls_peer_init(origin, peer, sslc, &ctx->ssl_peer, conn);
 }
 
 static void cf_quiche_ctx_free(struct cf_quiche_ctx *ctx)
@@ -1654,7 +1655,7 @@ CURLcode Curl_cf_quiche_create(struct Curl_cfilter **pcf,
     result = CURLE_OUT_OF_MEMORY;
     goto out;
   }
-  result = cf_quiche_ctx_init(ctx, origin, peer, &conn->ssl_config);
+  result = cf_quiche_ctx_init(ctx, origin, peer, &conn->ssl_config, conn);
   if(!result)
     result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
   if(result)
@@ -1693,7 +1694,8 @@ CURLcode Curl_cf_quiche_insert_after(struct Curl_cfilter *cf_at,
     result = CURLE_OUT_OF_MEMORY;
     goto out;
   }
-  result = cf_quiche_ctx_init(ctx, origin, peer, &cf_at->conn->ssl_config);
+  result = cf_quiche_ctx_init(ctx, origin, peer, &cf_at->conn->ssl_config,
+                              cf_at->conn);
   if(!result)
     result = Curl_cf_create(&cf, &Curl_cft_http3, ctx);
   if(result)

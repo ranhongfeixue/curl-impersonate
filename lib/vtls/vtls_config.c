@@ -112,6 +112,38 @@ void Curl_ssl_config_init(struct ssl_primary_config *sslc)
   sslc->cache_session = TRUE; /* caching by default */
 }
 
+static const char *ssl_config_get_transport_value(const char *value,
+                                                  const char *http3_value,
+                                                  uint8_t transport)
+{
+  if((transport == TRNSPRT_QUIC) && http3_value)
+    return http3_value;
+  return value;
+}
+
+const char *Curl_ssl_config_get_curves(
+  const struct ssl_primary_config *sslc, uint8_t transport)
+{
+  return ssl_config_get_transport_value(sslc->curves, sslc->http3_curves,
+                                        transport);
+}
+
+const char *Curl_ssl_config_get_signature_algorithms(
+  const struct ssl_primary_config *sslc, uint8_t transport)
+{
+  return ssl_config_get_transport_value(sslc->signature_algorithms,
+                                        sslc->http3_signature_algorithms,
+                                        transport);
+}
+
+const char *Curl_ssl_config_get_tls_extension_order(
+  const struct ssl_primary_config *sslc, uint8_t transport)
+{
+  return ssl_config_get_transport_value(sslc->tls_extension_order,
+                                        sslc->http3_tls_extension_order,
+                                        transport);
+}
+
 void Curl_ssl_config_cleanup(struct ssl_primary_config *sslc)
 {
   if(sslc->deep_copy) {
@@ -127,7 +159,12 @@ void Curl_ssl_config_cleanup(struct ssl_primary_config *sslc)
     curlx_safefree(sslc->issuercert_blob);
     curlx_safefree(sslc->key_blob);
     curlx_safefree(sslc->curves);
+    curlx_safefree(sslc->tls_extension_order);
+    curlx_safefree(sslc->cert_compression);
     curlx_safefree(sslc->signature_algorithms);
+    curlx_safefree(sslc->http3_curves);
+    curlx_safefree(sslc->http3_signature_algorithms);
+    curlx_safefree(sslc->http3_tls_extension_order);
     curlx_safefree(sslc->CRLfile);
     curlx_safefree(sslc->cert_type);
     curlx_safefree(sslc->key);
@@ -152,6 +189,7 @@ static bool match_ssl_primary_config(struct Curl_easy *data,
      (c1->verifypeer == c2->verifypeer) &&
      (c1->verifyhost == c2->verifyhost) &&
      (c1->verifystatus == c2->verifystatus) &&
+     (c1->enable_ticket == c2->enable_ticket) &&
      blobcmp(c1->cert_blob, c2->cert_blob) &&
      blobcmp(c1->ca_info_blob, c2->ca_info_blob) &&
      blobcmp(c1->issuercert_blob, c2->issuercert_blob) &&
@@ -167,7 +205,14 @@ static bool match_ssl_primary_config(struct Curl_easy *data,
      curl_strequal(c1->cipher_list, c2->cipher_list) &&
      curl_strequal(c1->cipher_list13, c2->cipher_list13) &&
      curl_strequal(c1->curves, c2->curves) &&
+     curl_strequal(c1->tls_extension_order, c2->tls_extension_order) &&
+     curl_strequal(c1->cert_compression, c2->cert_compression) &&
      curl_strequal(c1->signature_algorithms, c2->signature_algorithms) &&
+     curl_strequal(c1->http3_curves, c2->http3_curves) &&
+     curl_strequal(c1->http3_signature_algorithms,
+                   c2->http3_signature_algorithms) &&
+     curl_strequal(c1->http3_tls_extension_order,
+                   c2->http3_tls_extension_order) &&
      Curl_safecmp(c1->CRLfile, c2->CRLfile) &&
      Curl_safecmp(c1->pinned_key, c2->pinned_key) &&
      curl_strequal(c1->cert_type, c2->cert_type) &&
@@ -205,6 +250,7 @@ static bool clone_ssl_primary_config(struct ssl_primary_config *source,
   dest->verifyhost = source->verifyhost;
   dest->verifystatus = source->verifystatus;
   dest->cache_session = source->cache_session;
+  dest->enable_ticket = source->enable_ticket;
   dest->ssl_options = source->ssl_options;
 
   CLONE_BLOB(cert_blob);
@@ -217,7 +263,12 @@ static bool clone_ssl_primary_config(struct ssl_primary_config *source,
   CLONE_STRING(cipher_list13);
   CLONE_STRING(pinned_key);
   CLONE_STRING(curves);
+  CLONE_STRING(tls_extension_order);
+  CLONE_STRING(cert_compression);
   CLONE_STRING(signature_algorithms);
+  CLONE_STRING(http3_curves);
+  CLONE_STRING(http3_signature_algorithms);
+  CLONE_STRING(http3_tls_extension_order);
   CLONE_STRING(CRLfile);
   /* SSL credentials: client certificate, SRP auth */
   CLONE_STRING(clientcert);
@@ -253,10 +304,13 @@ static void ssl_easy_config_compl_options(struct Curl_peer *origin,
                            !!(options & CURLSSLOPT_AUTO_CLIENT_CERT);
 }
 
-CURLcode Curl_ssl_easy_config_complete(struct Curl_easy *data,
-                                       struct Curl_peer *origin)
+static CURLcode ssl_easy_config_complete(struct Curl_easy *data,
+                                         struct Curl_peer *origin,
+                                         struct connectdata *conn)
 {
   struct ssl_config_data *sslc = &data->set.ssl;
+  const bool is_wss = conn && conn->scheme &&
+    (conn->scheme->protocol & CURLPROTO_WSS);
 #if defined(CURL_CA_PATH) || defined(CURL_CA_BUNDLE)
   struct UserDefined *set = &data->set;
   CURLcode result;
@@ -293,6 +347,24 @@ CURLcode Curl_ssl_easy_config_complete(struct Curl_easy *data,
     data->set.str[STRING_SSL_SIGNATURE_ALGORITHMS];
   sslc->primary.ca_info_blob = data->set.blobs[BLOB_CAINFO];
   sslc->primary.curves = data->set.str[STRING_SSL_EC_CURVES];
+  sslc->primary.tls_extension_order =
+    data->set.str[STRING_TLS_EXTENSION_ORDER];
+  sslc->primary.cert_compression =
+    data->set.str[STRING_SSL_CERT_COMPRESSION];
+  sslc->primary.http3_curves = data->set.str[STRING_HTTP3_SSL_EC_CURVES];
+  sslc->primary.http3_signature_algorithms =
+    data->set.str[STRING_HTTP3_SIG_HASH_ALGS];
+  sslc->primary.http3_tls_extension_order =
+    data->set.str[STRING_HTTP3_TLS_EXTENSION_ORDER];
+  sslc->primary.enable_ticket = data->set.ssl_enable_ticket;
+
+  if(is_wss) {
+    if(data->set.ws_disable_session_ticket)
+      sslc->primary.enable_ticket = FALSE;
+    if(data->set.str[STRING_WS_SSL_CERT_COMPRESSION])
+      sslc->primary.cert_compression =
+        data->set.str[STRING_WS_SSL_CERT_COMPRESSION];
+  }
   /* Maybe these should not be used for another origin. But for
    * backwards compatibility, keep them in. */
   sslc->primary.issuercert = data->set.str[STRING_SSL_ISSUERCERT];
@@ -358,6 +430,7 @@ CURLcode Curl_ssl_easy_config_complete(struct Curl_easy *data,
   sslc->primary.CApath = data->set.str[STRING_SSL_CAPATH_PROXY];
   sslc->primary.cipher_list = data->set.str[STRING_SSL_CIPHER_LIST_PROXY];
   sslc->primary.cipher_list13 = data->set.str[STRING_SSL_CIPHER13_LIST_PROXY];
+  sslc->primary.enable_ticket = data->set.ssl_enable_ticket;
   sslc->primary.pinned_key = data->set.str[STRING_SSL_PINNEDPUBLICKEY_PROXY];
   sslc->primary.cert_blob = data->set.blobs[BLOB_CERT_PROXY];
   sslc->primary.ca_info_blob = data->set.blobs[BLOB_CAINFO_PROXY];
@@ -377,6 +450,18 @@ CURLcode Curl_ssl_easy_config_complete(struct Curl_easy *data,
 #endif /* CURL_DISABLE_PROXY */
 
   return CURLE_OK;
+}
+
+CURLcode Curl_ssl_easy_config_complete(struct Curl_easy *data,
+                                       struct Curl_peer *origin)
+{
+  return ssl_easy_config_complete(data, origin, NULL);
+}
+
+CURLcode Curl_ssl_easy_config_complete_conn(struct Curl_easy *data,
+                                            struct connectdata *conn)
+{
+  return ssl_easy_config_complete(data, conn->origin, conn);
 }
 
 CURLcode Curl_ssl_conn_config_init(struct Curl_easy *data,

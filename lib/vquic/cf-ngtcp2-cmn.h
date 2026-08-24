@@ -126,6 +126,7 @@ struct cf_ngtcp2_ctx {
   struct curltime handshake_at;     /* time connect handshake finished */
   struct bufc_pool stream_bufcp;    /* chunk pool for streams */
   struct dynbuf scratch;            /* temp buffer for header construction */
+  struct dynbuf tp_raw;             /* serialized local QUIC parameters */
   struct uint_hash streams;         /* hash data->mid to h3_stream_ctx */
   uint64_t used_bidi_streams;       /* bidi streams we have opened */
   uint64_t max_bidi_streams;        /* max bidi streams we can open */
@@ -152,6 +153,7 @@ CURLcode Curl_cf_ngtcp2_ctx_init(struct cf_ngtcp2_ctx *ctx,
                                  struct Curl_peer *origin,
                                  struct Curl_peer *peer,
                                  struct ssl_primary_config *sslc,
+                                 struct connectdata *conn,
                                  cf_ngtcp2_init_h3_conn *init_h3_conn_cb);
 void Curl_cf_ngtcp2_ctx_cleanup(struct cf_ngtcp2_ctx *ctx);
 void Curl_cf_ngtcp2_cmn_err_set(struct Curl_cfilter *cf,

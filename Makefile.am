@@ -68,13 +68,13 @@ EXTRA_DIST = CHANGES.md COPYING RELEASE-NOTES Dockerfile .clang-tidy.yml .editor
 
 DISTCLEANFILES = buildinfo.txt
 
-bin_SCRIPTS = curl-config
+bin_SCRIPTS = curl-impersonate-config
 
 SUBDIRS = lib docs src scripts
 DIST_SUBDIRS = $(SUBDIRS) tests projects include docs
 
 pkgconfigdir = $(libdir)/pkgconfig
-pkgconfig_DATA = libcurl.pc
+pkgconfig_DATA = libcurl-impersonate.pc
 
 dist-hook:
 	rm -rf $(top_builddir)/tests/log
