@@ -57,6 +57,9 @@
 #endif
 
 #include <openssl/rand.h>
+#ifdef OPENSSL_IS_BORINGSSL
+#include <openssl/sha.h>
+#endif
 #include <openssl/x509v3.h>
 #ifndef OPENSSL_NO_DSA
 #include <openssl/dsa.h>
@@ -1748,6 +1751,12 @@ static CURLcode x509_name_oneline(const X509_NAME *a, struct dynbuf *d)
  * @retval 0 error initializing SSL
  * @retval 1 SSL initialized successfully
  */
+#ifdef OPENSSL_IS_BORINGSSL
+/* curl-impersonate: per-process key for ossl_order_trust_anchors(), filled
+   once in ossl_init(). */
+static unsigned char ossl_trust_anchors_key[16];
+#endif
+
 static int ossl_init(void)
 {
   const uint64_t flags =
@@ -1765,6 +1774,12 @@ static int ossl_init(void)
 
 #ifndef HAVE_KEYLOG_UPSTREAM
   Curl_tls_keylog_open();
+#endif
+
+#ifdef OPENSSL_IS_BORINGSSL
+  /* curl-impersonate: a new trust anchor order for each process. If this
+     fails the key stays zero and the order is merely fixed. */
+  RAND_bytes(ossl_trust_anchors_key, sizeof(ossl_trust_anchors_key));
 #endif
 
   return 1;
@@ -3962,6 +3977,90 @@ static CURLcode ossl_init_ssl(struct ossl_ctx *octx,
                                      alpns_requested, sess_reuse_cb);
 }
 
+#ifdef OPENSSL_IS_BORINGSSL
+/* curl-impersonate: one hex digit to its value, -1 when not a hex digit.
+   Used only by the trust anchor IDs option, which is BoringSSL-only. */
+static int ossl_hexdigit(char c)
+{
+  if(c >= '0' && c <= '9')
+    return c - '0';
+  if(c >= 'a' && c <= 'f')
+    return c - 'a' + 10;
+  if(c >= 'A' && c <= 'F')
+    return c - 'A' + 10;
+  return -1;
+}
+
+struct ossl_trust_anchor {
+  const unsigned char *rec;  /* 8-bit length followed by the ID */
+  size_t len;                /* length of rec, length byte included */
+  unsigned char rank[SHA256_DIGEST_LENGTH];
+};
+
+static int ossl_trust_anchor_cmp(const void *a, const void *b)
+{
+  const struct ossl_trust_anchor *x = a;
+  const struct ossl_trust_anchor *y = b;
+  return memcmp(x->rank, y->rank, sizeof(x->rank));
+}
+
+/* curl-impersonate: reorder a wire-format trust anchor ID list in place.
+   Chromium writes the IDs in absl::flat_hash_set iteration order, which
+   holds for the life of the process and differs between processes. Ranking
+   each ID by a hash keyed with ossl_trust_anchors_key does the same: every
+   connection of one process sends one order, the next run sends another. */
+static CURLcode ossl_order_trust_anchors(struct Curl_easy *data,
+                                         unsigned char *ids, size_t len)
+{
+  struct ossl_trust_anchor *anchors;
+  unsigned char *out;
+  size_t n = 0;
+  size_t pos;
+  size_t i;
+
+  for(pos = 0; pos < len; pos += 1 + (size_t)ids[pos]) {
+    if(!ids[pos] || pos + 1 + ids[pos] > len) {
+      failf(data, "Invalid TLS trust anchors: malformed ID list");
+      return CURLE_SSL_CONNECT_ERROR;
+    }
+    n++;
+  }
+  if(n < 2)
+    return CURLE_OK;
+
+  anchors = curlx_malloc(n * sizeof(*anchors));
+  out = curlx_malloc(len);
+  if(!anchors || !out) {
+    curlx_free(anchors);
+    curlx_free(out);
+    return CURLE_OUT_OF_MEMORY;
+  }
+
+  for(i = 0, pos = 0; i < n; i++) {
+    SHA256_CTX sha;
+    anchors[i].rec = ids + pos;
+    anchors[i].len = 1 + (size_t)ids[pos];
+    SHA256_Init(&sha);
+    SHA256_Update(&sha, ossl_trust_anchors_key,
+                  sizeof(ossl_trust_anchors_key));
+    SHA256_Update(&sha, anchors[i].rec, anchors[i].len);
+    SHA256_Final(anchors[i].rank, &sha);
+    pos += anchors[i].len;
+  }
+  qsort(anchors, n, sizeof(*anchors), ossl_trust_anchor_cmp);
+
+  for(i = 0, pos = 0; i < n; i++) {
+    memcpy(out + pos, anchors[i].rec, anchors[i].len);
+    pos += anchors[i].len;
+  }
+  memcpy(ids, out, len);
+
+  curlx_free(anchors);
+  curlx_free(out);
+  return CURLE_OK;
+}
+#endif
+
 static CURLcode ossl_init_method(struct Curl_cfilter *cf,
                                  struct Curl_easy *data,
                                  struct ssl_peer *peer,
@@ -4337,6 +4436,11 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   else if(data->set.tls_grease)
     SSL_CTX_set_grease_enabled(octx->ssl_ctx, 1);
 
+  /* curl-impersonate: GREASE as the first signature algorithm, sent by
+     Chrome 152 and later. Chrome's QUIC ClientHello has none. */
+  if(peer->transport != TRNSPRT_QUIC && data->set.tls_grease_sigalgs)
+    SSL_CTX_set_grease_sigalgs_enabled(octx->ssl_ctx, 1);
+
   /*
    * curl-impersonate: Enable TLS extension permutation, enabled by default
    * since Chrome 110.
@@ -4359,6 +4463,49 @@ CURLcode Curl_ossl_ctx_init(struct ossl_ctx *octx,
   if(data->set.str[STRING_TLS_DELEGATED_CREDENTIALS])
     SSL_CTX_set_delegated_credentials(
       octx->ssl_ctx, data->set.str[STRING_TLS_DELEGATED_CREDENTIALS]);
+
+  /* curl-impersonate: TLS trust anchor IDs, extension 0xca34. The value is the
+     wire-format list in hex; BoringSSL sends the extension even for an empty
+     list, which is what Chrome does when it requests no specific anchors. */
+  if(data->set.str[STRING_TLS_TRUST_ANCHORS]) {
+    const char *hex = data->set.str[STRING_TLS_TRUST_ANCHORS];
+    size_t hexlen = strlen(hex);
+    unsigned char *ids = NULL;
+    int ok;
+
+    if(hexlen % 2) {
+      failf(data, "Invalid TLS trust anchors: odd number of hex digits");
+      return CURLE_SSL_CONNECT_ERROR;
+    }
+    if(hexlen) {
+      size_t i;
+      CURLcode result;
+      ids = curlx_malloc(hexlen / 2);
+      if(!ids)
+        return CURLE_OUT_OF_MEMORY;
+      for(i = 0; i < hexlen / 2; i++) {
+        int hi = ossl_hexdigit(hex[i * 2]);
+        int lo = ossl_hexdigit(hex[i * 2 + 1]);
+        if(hi < 0 || lo < 0) {
+          curlx_free(ids);
+          failf(data, "Invalid TLS trust anchors: not a hex string");
+          return CURLE_SSL_CONNECT_ERROR;
+        }
+        ids[i] = (unsigned char)((hi << 4) | lo);
+      }
+      result = ossl_order_trust_anchors(data, ids, hexlen / 2);
+      if(result) {
+        curlx_free(ids);
+        return result;
+      }
+    }
+    ok = SSL_CTX_set1_requested_trust_anchors(octx->ssl_ctx, ids, hexlen / 2);
+    curlx_free(ids);
+    if(!ok) {
+      failf(data, "Could not set TLS trust anchors");
+      return CURLE_SSL_CONNECT_ERROR;
+    }
+  }
 
   if(data->set.tls_record_size_limit)
     SSL_CTX_set_record_size_limit(octx->ssl_ctx,

@@ -566,6 +566,11 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
   if(ret)
     return ret;
 
+  ret = curl_easy_setopt(data, CURLOPT_TLS_GREASE_SIGALGS,
+                         opts->tls_grease_sigalgs);
+  if(ret)
+    return ret;
+
   if(opts->tls_extension_order) {
     ret = curl_easy_setopt(data, CURLOPT_TLS_EXTENSION_ORDER,
                            opts->tls_extension_order);
@@ -582,6 +587,12 @@ static CURLcode _do_impersonate(struct Curl_easy *data,
 
   if(opts->tls_delegated_credentials) {
     ret = curl_easy_setopt(data, CURLOPT_TLS_DELEGATED_CREDENTIALS, opts->tls_delegated_credentials);
+    if(ret)
+      return ret;
+  }
+
+  if(opts->tls_trust_anchors) {
+    ret = curl_easy_setopt(data, CURLOPT_TLS_TRUST_ANCHORS, opts->tls_trust_anchors);
     if(ret)
       return ret;
   }

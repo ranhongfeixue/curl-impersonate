@@ -59,9 +59,12 @@ struct impersonate_opts {
   const char *tls_extension_order;
   const char *http3_tls_extension_order;
   const char *tls_delegated_credentials;
+  /* TLS trust anchor IDs (extension 0xca34), wire-format list in hex. */
+  const char *tls_trust_anchors;
   int tls_record_size_limit;
   int tls_key_shares_limit;  // for firefox key_shares extension
   bool tls_grease;
+  bool tls_grease_sigalgs;  // GREASE as the first signature algorithm, Chrome 152+
   int http2_stream_weight;
   int http2_stream_exclusive;
   bool http2_no_priority;  // disable http2 priority in header frame

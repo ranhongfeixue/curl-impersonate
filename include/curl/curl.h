@@ -2340,6 +2340,18 @@ typedef enum {
   /* curl-impersonate: firefox delegated credentials */
   CURLOPT(CURLOPT_TLS_DELEGATED_CREDENTIALS, CURLOPTTYPE_STRINGPOINT, 1017),
 
+  /* curl-impersonate: TLS trust anchor IDs, extension 0xca34
+     (draft-ietf-tls-trust-anchor-ids). Chrome sends it by default since 141.
+     The value is the wire-format list in hex: a series of 8-bit
+     length-prefixed IDs. An empty string still sends the extension.
+     The IDs are sent in an order that is fixed for the life of the process
+     and differs between processes, like Chrome's. */
+  CURLOPT(CURLOPT_TLS_TRUST_ANCHORS, CURLOPTTYPE_STRINGPOINT, 1039),
+
+  /* curl-impersonate: send a GREASE value as the first signature algorithm
+     (RFC 8701), as Chrome does since 152. TCP only, never over QUIC. */
+  CURLOPT(CURLOPT_TLS_GREASE_SIGALGS, CURLOPTTYPE_LONG, 1040),
+
   /* curl-impersonate: firefox record size limit */
   CURLOPT(CURLOPT_TLS_RECORD_SIZE_LIMIT, CURLOPTTYPE_LONG, 1018),
 

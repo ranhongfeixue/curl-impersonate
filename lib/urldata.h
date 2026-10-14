@@ -921,6 +921,7 @@ enum dupstring {
   STRING_TLS_EXTENSION_ORDER,
   STRING_HTTP3_TLS_EXTENSION_ORDER,
   STRING_TLS_DELEGATED_CREDENTIALS,
+  STRING_TLS_TRUST_ANCHORS,
   STRING_SSL_SIGNATURE_ALGORITHMS, /* CURLOPT_SSL_SIGNATURE_ALGORITHMS */
 
   /* -- end of null-terminated strings -- */
@@ -1232,6 +1233,7 @@ struct UserDefined {
   BIT(ws_disable_session_ticket); /* disable WebSocket TLS session ticket */
   BIT(ssl_permute_extensions); /* TLS Permute extensions */
   BIT(tls_grease);  /* TLS grease? */
+  BIT(tls_grease_sigalgs);  /* GREASE signature algorithm? */
   BIT(tls_key_usage_no_check);  /* TLS key_usage_check? */
   BIT(tls_signed_cert_timestamps);  /* TLS signed cert timestamps? */
   BIT(tls_status_request);  /* TLS status request */
